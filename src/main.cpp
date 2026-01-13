@@ -17,7 +17,12 @@ const int TRIG_PIN = 5;
 const int ECHO_PIN = 4;
 const int GAS1_PIN = 1;
 const int GAS2_PIN = 2;
-const int CAM_PIN = 10;
+const int CAM_PIN = 18;
+const int FACE_PIN = 11;
+const int RATIO_ADC_PIN = 9;
+#define MA_WINDOW 5
+#define EYE_THRESHOLD   2000
+#define DROWSY_TIME_MS  4000
 const unsigned long MAX_ECHO_TIME = 38000UL;
 const unsigned long sendInterval = 20000;
 
@@ -44,6 +49,9 @@ float dax = 0;
 float day = 0;
 float daz = 0;
 
+int faceFound = 0;
+int eyeCam = 0;
+
 float distance = 0;
 unsigned long lastSend = 0;
 unsigned long lastCheck = 0;
@@ -56,6 +64,36 @@ double velocity = 0.0;
 double lastLat = 0.0;
 double lastLon = 0.0;
 bool hasLast = false;
+
+bool drowsyDetected = false;
+unsigned long drowsyStartTime = 0;
+
+struct MovingAverage {
+  float buffer[MA_WINDOW];
+  float sum = 0;
+  int index = 0;
+  bool filled = false;
+
+  float update(float value) {
+    sum -= buffer[index];
+    buffer[index] = value;
+    sum += value;
+
+    index++;
+    if (index >= MA_WINDOW) {
+      index = 0;
+      filled = true;
+    }
+
+    return filled ? (sum / MA_WINDOW) : (sum / index);
+  }
+};
+
+MovingAverage maX;
+MovingAverage maY;
+MovingAverage maZ;
+
+float axAvg, ayAvg, azAvg;
 
 double haversine(double lat1, double lon1, double lat2, double lon2) {
   const double R = 6371000.0; // Earth radius in meters
@@ -179,7 +217,10 @@ void sendToThingSpeak() {
     "&field2=" + String(lat, 6) +
     "&field3=" + String(lon, 6) +
     "&field4=" + String(gas1) +
-    "&field5=" + String(gas2);
+    "&field5=" + String(gas2) +
+    "&field6=" + String(dax) +
+    "&field7=" + String(day) +
+    "&field8=" + String(daz);
 
   Serial.println("Request: " + url);
 
@@ -226,10 +267,18 @@ void handleMessage(int numMessages) {
     String chat_id = bot.messages[i].chat_id;
     String text = bot.messages[i].text;
 
+    Serial.println(text);
+
     if (text == "/location") {
       String message = "https://maps.google.com/?q=" 
           + String(lat, 6) + "," + String(lon, 6);
       sendTelegram(message);
+    } else if (text == "/photo") {
+      for (int i = 1; i < 10; i++) {
+        digitalWrite(CAM_PIN, HIGH);
+        delay(10);
+      }
+      digitalWrite(CAM_PIN, LOW);
     }
   }
 }
@@ -249,10 +298,14 @@ void setup() {
 
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
-
+  pinMode(CAM_PIN, OUTPUT);
   pinMode(AX_PIN, INPUT);
   pinMode(AY_PIN, INPUT);
   pinMode(AZ_PIN, INPUT);
+
+  pinMode(FACE_PIN, INPUT_PULLDOWN);
+  analogReadResolution(12); // 0–4095
+  analogSetAttenuation(ADC_11db); 
 
   GPS.begin(9600, SERIAL_8N1, 16, 17);
 
@@ -276,12 +329,13 @@ void setup() {
   az = readAndConvertADXL335(AZ_PIN);
 
   sendTelegram("[DEBUG] System Ready");
+  dfplayer.play(1);
 
-  const String commands = F("["
-                            "{\"command\":\"location\",  \"description\":\"melihat update lokasi\"}"
-                            "]");
-  bot.setMyCommands(commands);
-  dfplayer.play(2);
+  for (int i = 1; i < 10; i++) {
+    digitalWrite(CAM_PIN, HIGH);
+    delay(10);
+  }
+  digitalWrite(CAM_PIN, LOW);
 }
 
 void loop() {
@@ -292,6 +346,21 @@ void loop() {
   day = abs(readAndConvertADXL335(AY_PIN) - ay);
   daz = abs(readAndConvertADXL335(AZ_PIN) - az);
 
+  dax = constrain(dax, 0.0, 1.0);
+  day = constrain(day, 0.0, 1.0);
+  daz = constrain(daz, 0.0, 1.0);
+
+  axAvg = maX.update(dax);
+  ayAvg = maY.update(day);
+  azAvg = maZ.update(daz);
+
+  faceFound = digitalRead(FACE_PIN);
+  eyeCam = 0;
+  for (int i = 0; i < 32; i++) {
+    eyeCam += analogRead(RATIO_ADC_PIN);
+  }
+  eyeCam >>= 5;
+
   velocity = calculateVelocity(lat, lon);
 
   if (readGPS(lat, lon)) {
@@ -301,11 +370,15 @@ void loop() {
     Serial.print("  ");
     Serial.print(gas2);
     Serial.print(" || ");
-    Serial.print(dax, 2); Serial.print(",");
-    Serial.print(day, 2); Serial.print(",");
-    Serial.print(daz, 2);
+    Serial.print(axAvg, 2); Serial.print(",");
+    Serial.print(ayAvg, 2); Serial.print(",");
+    Serial.print(azAvg, 2);
     Serial.print(" || ");
-    Serial.print(velocity);                                                                                                                                                                                                                                                                                                 
+    Serial.print(velocity);
+    Serial.print(" || cam: ");
+    Serial.print(faceFound); 
+    Serial.print(",");  
+    Serial.print(eyeCam);                                                                                                                                                                                                                                                                                                  
     Serial.print(" || https://maps.google.com/?q=");
     Serial.print(lat, 6); Serial.print(",");
     Serial.println(lon, 6);
@@ -313,28 +386,70 @@ void loop() {
     currentLocation = String(lat, 6) + "," + String(lon, 6);
   }
 
-  if (dax > maxAx || day > maxAy || daz > maxAz) {
+  if (axAvg > maxAx || ayAvg > maxAy || azAvg > maxAz) {
+    Serial.print(axAvg);
+    Serial.print("\t");
+    Serial.print(ayAvg);
+    Serial.print("\t");
+    Serial.print(azAvg);
+    Serial.println("\t");
     sendTelegram(carRolledOverMessage + currentLocation);
+    dfplayer.play(7);
+
     delay(1000);
   }
 
   if (gas1 > maxGas1){
     sendTelegram(gas1Message);
+    dfplayer.play(3);
     delay(1000);
   }
 
   if (gas2 > maxGas2){
+    dfplayer.play(4);
     sendTelegram(gas2Message);
     delay(1000);
   }
 
-  if (distance >= maxDistance && distance <= minDistance){
-    sendTelegram(distanceMessage);
+  if (distance < minDistance) {
+    dfplayer.play(5);
+    sendTelegram(minDistanceMessage);
     delay(1000);
+
+  } else if (distance >= minDistance && distance < midDistance) {
+    dfplayer.play(6);
+    sendTelegram(midDistanceMessage);
+    delay(1000);
+  } else if (distance >= midDistance && distance <= maxDistance) {
+    
   }
 
-  if (velocity > maxVelocity){
+  if (faceFound && eyeCam > EYE_THRESHOLD) {
+    if (drowsyStartTime == 0) {
+      drowsyStartTime = millis();
+    } else if (millis() - drowsyStartTime >= DROWSY_TIME_MS) {
+      drowsyDetected = true;
+    }
+  } else {
+    drowsyStartTime = 0;
+    drowsyDetected = false;
+  }
+
+  if (drowsyDetected) {
+    Serial.println("DROWSINESS DETECTED!");
+    
+    dfplayer.play(2);
+
+    for (int i = 1; i < 10; i++) {
+      digitalWrite(CAM_PIN, HIGH);
+      delay(10);
+    }
+    digitalWrite(CAM_PIN, LOW);
+  }
+
+  if (velocity >= maxVelocity && velocity <= 500){
     sendTelegram(velocityMessage);
+    dfplayer.play(8);
     delay(1000);
   }
 
